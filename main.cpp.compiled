@@ -1,0 +1,666 @@
+#include <Arduino.h>
+#include <avr/pgmspace.h>
+#include "Air_Quality_Sensor.h"
+#include "rgb_lcd.h"
+
+#include "components/Buzzer.hpp"
+#include "components/LcdRgbDisplay.hpp"
+
+#include "utils/ThreadManager.hpp"
+#include "utils/SerialTxQueue.hpp"
+#include "utils/SerialLogQueue.hpp"
+
+// ------------------------------
+// Module name constants
+// ------------------------------
+
+#define MOD_SYS  F("SYS")
+#define MOD_CMD  F("CMD")
+#define MOD_SENS F("SENS")
+#define MOD_UI   F("UI")
+
+// ------------------------------
+// Global Constants
+// ------------------------------
+
+constexpr uint32_t SERIAL_TIMEOUT_MS = 3000; // 3s no traffic => disconnected
+constexpr uint8_t PIN_TEMP_SENSOR = A0;
+constexpr uint8_t PIN_AIR_QUALITY_SENSOR = A1;
+constexpr uint8_t PIN_MINI_PIR_MOTION_SENSOR = 2;
+constexpr uint8_t PIN_LEFT_PUSH_BUTTON = 4;
+constexpr uint8_t PIN_RIGHT_PUSH_BUTTON = 8;
+constexpr uint8_t PIN_BUZZER = 12;
+
+// ------------------------------
+// Serial link state
+// ------------------------------
+static bool serialConnected = false;
+static uint32_t lastPingAt = 0;
+static bool displayUsedByConnectionStatus = false;
+
+// ------------------------------
+// Components
+// ------------------------------
+
+AirQualitySensor air_quality(PIN_AIR_QUALITY_SENSOR);
+rgb_lcd lcd;
+
+// Threading & Logging
+static ThreadManager<8> tm;
+static SerialLogQueue<8> logQ;
+static SerialTxQueue<6, 64> txQ;
+static LcdTxtState lcdRow[2];
+
+// Input variables
+static float inputTemperature;  // In °C
+static int inputAirQualityValue;
+static bool inputMotionDetected;
+static bool leftButtonPressed;
+static bool rightButtonPressed;
+
+// Output variables
+static BuzzerAlarmType output_buzzer_type = ALARM_IDLE;
+static uint8_t output_display_rgb[3] = {255, 255, 255};
+static bool output_display_disable_light;
+
+// Prototypes - Main Program
+void ThreadSerialManager(uint32_t now);
+void ThreadSerialLinkMonitor(uint32_t now);
+void ThreadHandleCommand(uint32_t now);
+void ThreadHandleBuzzer(uint32_t now);
+void ThreadHandleLCD(uint32_t now);
+void ThreadHandleInputPushButton(uint32_t now);
+void ThreadHandleSensors(uint32_t now);
+
+
+// Prototypes - Helpers
+static void handleCommandLine(char* line);
+static void showStatusDisconnected();
+static void showStatusConnected();
+static void resetAllState();
+static void renderRow(uint8_t row, uint32_t now);
+static void lcdWriteRow(uint8_t row, const char* s16);
+
+void printUTF8(const char* str) {
+  while (*str) {
+    uint8_t c = (uint8_t)*str++;
+    if (c == 0xC2) { // UTF-8 prefix for degree symbol
+      uint8_t next = (uint8_t)*str++;
+      if (next == 0xB0) lcd.write(0xDF); // Map ° to LCD degree symbol
+    } else {
+      lcd.write(c);
+    }
+  }
+}
+
+void setup()
+{
+	Serial.begin(9600);
+	LOG_I(logQ, MOD_SYS, F("Boot"));
+	
+	lcd.begin(16, 2);
+	lcd.setColorWhite();
+
+	pinMode(PIN_TEMP_SENSOR, INPUT);
+	pinMode(PIN_MINI_PIR_MOTION_SENSOR, INPUT);
+	pinMode(PIN_LEFT_PUSH_BUTTON, INPUT);
+	pinMode(PIN_RIGHT_PUSH_BUTTON, INPUT);
+	pinMode(PIN_BUZZER, OUTPUT);
+
+	air_quality.init();
+	
+	showStatusDisconnected();
+
+	tm.add(ThreadSerialManager, 5);
+	tm.add(ThreadSerialLinkMonitor, 10);
+	tm.add(ThreadHandleCommand, 20);
+	
+	tm.add(ThreadHandleBuzzer, 15);
+	tm.add(ThreadHandleLCD, 50);
+	
+	tm.add(ThreadHandleInputPushButton, 30);
+	tm.add(ThreadHandleSensors, 1000);
+}
+
+void loop()
+{
+	tm.run(millis());
+}
+
+void ThreadSerialManager(uint32_t now)
+{
+	(void)now;
+
+	// Print logs directly (still single-writer, ordered, zero extra RAM buffers)
+	SerialLogQueue<8>::Msg m;
+	while (logQ.pop(m)) {
+		Serial.print(F("L,"));
+		Serial.print((uint8_t)m.type);
+		Serial.print(',');
+		Serial.print(m.module);
+		Serial.print(',');
+		Serial.println(m.text);
+	}
+
+	// Drain TX queue for responses/events
+	SerialTxQueue<6,64>::Frame f;
+	while (txQ.pop(f)) {
+		Serial.println(f.line);
+	}
+}
+
+void ThreadSerialLinkMonitor(uint32_t now) {
+	if (!serialConnected) return;
+
+	if ((uint32_t)(now - lastPingAt) > SERIAL_TIMEOUT_MS) {
+		serialConnected = false;
+		resetAllState();
+		showStatusDisconnected();
+		LOG_I(logQ, MOD_SYS, F("LINK_DOWN"));
+	}
+}
+
+void ThreadHandleCommand(uint32_t now)
+{
+	(void)now;
+
+	static char rxBuf[64];
+	static uint8_t rxLen = 0;
+
+	while (Serial.available() > 0) {
+		char c = (char)Serial.read();
+
+		if (c == '\n' || c == '\r') {
+			if (rxLen == 0) continue;
+
+			rxBuf[rxLen] = '\0';
+			rxLen = 0;
+
+			// Heartbeat "PING" to check if connection is still alive
+			if (strcmp_P(rxBuf, PSTR("PING")) == 0) {
+				lastPingAt = now;
+
+				if (!serialConnected) {
+					serialConnected = true;
+					showStatusConnected();
+					LOG_I(logQ, MOD_SYS, F("LINK_UP"));
+				}
+				
+				txQ.pushF(FR_RSP, F("P,0,ALIVE"));
+				continue;
+			}
+
+			// If disconnected, ignore other lines but do NOT get stuck
+			if (!serialConnected) continue;
+
+			// Normal command protocol
+			handleCommandLine(rxBuf);
+		}
+		else {
+			if (rxLen < sizeof(rxBuf) - 1) {
+				rxBuf[rxLen++] = c;
+			} else {
+				// overflow: reset buffer safely
+				rxLen = 0;
+				if (serialConnected) txQ.pushF(FR_RSP, F("R,1,RX_OVERFLOW"));
+			}
+		}
+	}
+}
+
+void ThreadHandleBuzzer(uint32_t now)
+{
+	enum : uint8_t { PHASE_OFF = 0, PHASE_ON = 1 };
+
+	static BuzzerAlarmType lastType = ALARM_IDLE;
+	static uint8_t phase = PHASE_OFF;
+	static uint8_t beepIndex = 0;       // 0..beepsPerGroup-1
+	static uint8_t groupsDone = 0;      // how many groups completed
+	static uint32_t nextAt = 0;
+
+	// Reset when alarm type changes
+	if (output_buzzer_type != lastType)
+	{
+		lastType = output_buzzer_type;
+		phase = PHASE_OFF;
+		beepIndex = 0;
+		groupsDone = 0;
+		nextAt = now;
+
+		digitalWrite(PIN_BUZZER, LOW);
+
+		// If going idle => fully stopped => light ON
+		// If going active => we start in OFF phase => pause => light OFF
+		output_display_disable_light = (output_buzzer_type == ALARM_IDLE) ? false : true;
+	}
+
+	// Fully stopped
+	if (output_buzzer_type == ALARM_IDLE) {
+		digitalWrite(PIN_BUZZER, LOW);
+		output_display_disable_light = false;
+		return;
+	}
+
+	if ((int32_t)(now - nextAt) < 0) return;
+
+	const BuzzerPattern p = getPattern(output_buzzer_type);
+	if (p.beepsPerGroup == 0) {
+		digitalWrite(PIN_BUZZER, LOW);
+		output_display_disable_light = false;  // treat as stopped
+		output_buzzer_type = ALARM_IDLE;
+		return;
+	}
+
+	// Finite play completed => stop altogether
+	if (p.groupsToPlay != 0 && groupsDone >= p.groupsToPlay) {
+		digitalWrite(PIN_BUZZER, LOW);
+		output_display_disable_light = false;
+		output_buzzer_type = ALARM_IDLE;
+		return;
+	}
+
+	// OFF -> ON (start beep)
+	if (phase == PHASE_OFF) {
+		digitalWrite(PIN_BUZZER, HIGH);
+		output_display_disable_light = false;
+
+		phase = PHASE_ON;
+		nextAt = now + p.onMs;
+		return;
+	}
+
+	// ON -> OFF (end beep, enter pause)
+	digitalWrite(PIN_BUZZER, LOW);
+	output_display_disable_light = true;
+
+	phase = PHASE_OFF;
+	beepIndex++;
+
+	if (beepIndex >= p.beepsPerGroup)
+	{
+		beepIndex = 0;
+		groupsDone++;
+
+		// If that completion hits the limit, stop immediately (no extra gap)
+		if (p.groupsToPlay != 0 && groupsDone >= p.groupsToPlay)
+		{
+			output_buzzer_type = ALARM_IDLE;
+			digitalWrite(PIN_BUZZER, LOW);
+			output_display_disable_light = false;
+			return;
+		}
+
+		nextAt = now + p.gapMs; // gap between groups (pause)
+	}
+	else
+	{
+		nextAt = now + p.offMs; // pause between beeps
+	}
+}
+
+void ThreadHandleLCD(uint32_t now)
+{
+	if (output_display_disable_light) 
+		lcd.setRGB(0, 0, 0);
+	else lcd.setRGB((uint8_t)output_display_rgb[0], (uint8_t)output_display_rgb[1], (uint8_t)output_display_rgb[2]);
+	
+	
+	renderRow(0, now);
+	renderRow(1, now);
+}
+
+void ThreadHandleInputPushButton(uint32_t now) 
+{
+	(void)now;
+	
+	static bool lastL = false;
+	static bool lastR = false;
+
+	bool L = (digitalRead(PIN_LEFT_PUSH_BUTTON) == HIGH);
+	bool R = (digitalRead(PIN_RIGHT_PUSH_BUTTON) == HIGH);
+
+	leftButtonPressed  = L;
+	rightButtonPressed = R;
+
+	if (!serialConnected) return;
+	
+	if (L && !lastL) {
+		LOG_I(logQ, MOD_UI, F("BUTTON,L"));
+	}
+	if (R && !lastR) {
+		LOG_I(logQ, MOD_UI, F("BUTTON,R"));
+	}
+
+	lastL = L;
+	lastR = R;
+}
+
+void ThreadHandleSensors(uint32_t now)
+{
+	(void)now;
+
+	// ---- Read sensors ----
+	const int raw = analogRead(PIN_TEMP_SENSOR);
+	const float voltage = raw * (5.0f / 1023.0f);
+	
+	inputTemperature = (voltage - 0.5f) * 100.0f;
+	int quality = air_quality.slope();
+	inputAirQualityValue = air_quality.getValue();
+	inputMotionDetected = (digitalRead(PIN_MINI_PIR_MOTION_SENSOR) == HIGH);
+	
+	if (!serialConnected) return;
+
+	// Log Temperature Sensor
+	{
+		char logBuffer[20];  // enough for "TEMP," + "-123.45" + '\0'
+		strcpy_P(logBuffer, PSTR("TEMP,"));
+
+		// append after "TEMP,"
+		dtostrf(inputTemperature, 0, 2, logBuffer + 5);
+
+		LOG_I(logQ, MOD_SENS, logBuffer);
+	}
+	
+	// Log Air Quality Sensor
+	{
+		char logBuffer[20];  // enough for "AIR_QUALITY," + value + "," + quality
+		strcpy_P(logBuffer, PSTR("AIR_QUALITY,"));
+		itoa(inputAirQualityValue, logBuffer + 12, 10);
+		// Find the end of the current string
+		uint8_t len = (uint8_t)strlen(logBuffer);
+		if (len < sizeof(logBuffer) - 1) {
+			logBuffer[len++] = ',';
+			itoa(quality, logBuffer + len, 10);
+		}
+		
+		LOG_I(logQ, MOD_SENS, logBuffer);
+	}
+
+	// Log Motion Sensor
+	{
+		char logBuffer[10]; // "MOTION,1" + '\0'
+		strcpy_P(logBuffer, PSTR("MOTION,"));
+		logBuffer[7] = inputMotionDetected ? '1' : '0';
+		logBuffer[8] = '\0';
+
+		LOG_I(logQ, MOD_SENS, logBuffer);
+	}
+}
+
+static void handleCommandLine(char* line)
+{
+	// Expected formats (examples):
+	// CMD,PING
+	// CMD,LCDRGB,255,0,0
+	// CMD,BUZZER,1
+	
+	// Quick prefix check
+	if (strncmp_P(line, PSTR("CMD,"), 4) != 0)
+	{
+		txQ.pushF(FR_RSP, F("R,1,BAD_PREFIX"));
+		return;
+	}
+
+	// Tokenize in-place
+	char* saveptr = nullptr;
+	char* tok = strtok_r(line, ",", &saveptr); // "CMD"
+	tok = strtok_r(nullptr, ",", &saveptr);    // command name
+	if (!tok)
+	{
+		txQ.pushF(FR_RSP, F("R,1,NO_CMD"));
+		return;
+	}
+	
+	// ---- CMD,LCDRGB,r,g,b ----
+	if (strcmp_P(tok, PSTR("LCDRGB")) == 0)
+	{
+		char* rS = strtok_r(nullptr, ",", &saveptr);
+		char* gS = strtok_r(nullptr, ",", &saveptr);
+		char* bS = strtok_r(nullptr, ",", &saveptr);
+		if (!rS || !gS || !bS) {
+			txQ.pushF(FR_RSP, F("R,1,ARGS"));
+			return;
+		}
+
+		int r = atoi(rS), g = atoi(gS), b = atoi(bS);
+		
+		if (r < 0) r = 0;
+		if (r > 255) r = 255;
+		if (g < 0) g = 0;
+		if (g > 255) g = 255;
+		if (b < 0) b = 0;
+		if (b > 255) b = 255;
+
+		// Update output state + LCD immediately
+		output_display_rgb[0] = (uint8_t)r;
+		output_display_rgb[1] = g;
+		output_display_rgb[2] = b;
+
+		txQ.pushF(FR_RSP, F("R,0,OK"));
+		LOG_I(logQ, MOD_CMD, F("LCDRGB"));
+		return;
+	}
+	
+	// ---- CMD,LCDTXT,0,0,TEXT
+	if (strcmp_P(tok, PSTR("LCDTXT")) == 0)
+	{
+		char* modeS = strtok_r(nullptr, ",", &saveptr);
+		if (!modeS) { txQ.pushF(FR_RSP, F("R,1,ARGS")); return; }
+		int mode = atoi(modeS);
+
+		if (mode == 0) {
+			char* rowS = strtok_r(nullptr, ",", &saveptr);
+			char* text = strtok_r(nullptr, "", &saveptr); // rest of line
+			if (!rowS || !text) { txQ.pushF(FR_RSP, F("R,1,ARGS")); return; }
+
+			uint8_t row = clampRow(atoi(rowS));
+			LcdTxtState &st = lcdRow[row];
+
+			st.enabled = true;
+			st.secondaryMode = false;
+			st.offset = 0;
+			st.nextAt = 0;
+
+			strncpy(st.text, text, sizeof(st.text) - 1);
+			st.text[sizeof(st.text) - 1] = '\0';
+
+			txQ.pushF(FR_RSP, F("R,0,OK"));
+			return;
+		}
+
+		if (mode == 1) {
+			char* rowS = strtok_r(nullptr, ",", &saveptr);
+			char* primary = strtok_r(nullptr, ",", &saveptr);
+			char* secondary = strtok_r(nullptr, "", &saveptr); // rest of line
+			if (!rowS || !primary || !secondary) { txQ.pushF(FR_RSP, F("R,1,ARGS")); return; }
+
+			uint8_t row = clampRow(atoi(rowS));
+			LcdTxtState &st = lcdRow[row];
+
+			st.enabled = true;
+			st.secondaryMode = true;
+			st.offset = 0;
+			st.nextAt = 0;
+
+			strncpy(st.primary, primary, sizeof(st.primary) - 1);
+			st.primary[sizeof(st.primary) - 1] = '\0';
+
+			strncpy(st.secondary, secondary, sizeof(st.secondary) - 1);
+			st.secondary[sizeof(st.secondary) - 1] = '\0';
+
+			txQ.pushF(FR_RSP, F("R,0,OK"));
+			return;
+		}
+
+		txQ.pushF(FR_RSP, F("R,1,INVALID_MODE"));
+		return;
+	}
+
+	// ---- CMD,BUZZER,type ----
+	if (strcmp_P(tok, PSTR("BUZZER")) == 0)
+	{
+		char* tS = strtok_r(nullptr, ",", &saveptr);
+		if (!tS)
+		{
+			txQ.pushF(FR_RSP, F("R,1,ARGS"));
+			return;
+		}
+		
+		int t = atoi(tS);
+		if (t < 0) t = 0;
+
+		if (!isValidAlarm((BuzzerAlarmType)t))
+		{
+			txQ.pushF(FR_RSP, F("R,1,INVALID_ALARM"));
+			return;
+		}
+		
+		output_buzzer_type = (BuzzerAlarmType)t;
+
+		txQ.pushF(FR_RSP, F("R,0,OK"));
+		LOG_I(logQ, MOD_CMD, F("BUZZER"));
+		return;
+	}
+
+	// Unknown command
+	txQ.pushF(FR_RSP, F("R,1,UNKNOWN_CMD"));
+}
+
+static void renderRow(uint8_t row, uint32_t now)
+{
+	LcdTxtState &st = lcdRow[row];
+	if (!st.enabled) return;
+	
+	// If status screen was last shown, clear once before first LCDTXT render
+	if (displayUsedByConnectionStatus) {
+		lcd.clear();
+		displayUsedByConnectionStatus = false;
+
+		// Optional: reset scroll timing so first render happens immediately
+		st.nextAt = 0;
+		st.offset = 0;
+	}
+
+	// per-row timing gate
+	if ((int32_t)(now - st.nextAt) < 0) return;
+	st.nextAt = now + 250; // per-row scroll speed
+
+	char line[17];
+	line[16] = '\0';
+	for (uint8_t i = 0; i < 16; i++) line[i] = ' ';
+
+	if (!st.secondaryMode)
+	
+	{
+		const char* t = st.text;
+		uint8_t len = (uint8_t)strlen(t);
+
+		if (len <= 16)
+		{
+			for (uint8_t i = 0; i < 16; i++) line[i] = (i < len) ? t[i] : ' ';
+			lcdWriteRow(row, line);
+			return;
+		}
+
+		const uint8_t gap = 3;
+		uint16_t cycleLen = (uint16_t)len + gap;
+
+		for (uint8_t i = 0; i < 16; i++)
+		{
+			uint16_t idx = (st.offset + i) % cycleLen;
+			line[i] = (idx < len) ? t[idx] : ' ';
+		}
+
+		lcdWriteRow(row, line);
+		st.offset = (st.offset + 1) % cycleLen;
+		return;
+	}
+
+	// secondary mode: <primary>:<secondary-window>
+	const char* p = st.primary;
+	const char* s = st.secondary;
+
+	uint8_t pLen = (uint8_t)strlen(p);
+	if (pLen > 8) pLen = 8;
+
+	uint8_t used = pLen + 1;              // + ':'
+	uint8_t avail = (used >= 16) ? 0 : (uint8_t)(16 - used);
+
+	for (uint8_t i = 0; i < pLen && i < 16; i++) line[i] = p[i];
+	if (pLen < 16) line[pLen] = ':';
+
+	if (avail == 0) 
+	{
+		lcdWriteRow(row, line);
+		return;
+	}
+
+	uint8_t sLen = (uint8_t)strlen(s);
+
+	if (sLen <= avail)
+	{
+		for (uint8_t i = 0; i < avail; i++) line[used + i] = (i < sLen) ? s[i] : ' ';
+		lcdWriteRow(row, line);
+		return;
+	}
+
+	const uint8_t gap = 3;
+	uint16_t cycleLen = (uint16_t)sLen + gap;
+
+	for (uint8_t i = 0; i < avail; i++)
+	{
+		uint16_t idx = (st.offset + i) % cycleLen;
+		line[used + i] = (idx < sLen) ? s[idx] : ' ';
+	}
+
+	lcdWriteRow(row, line);
+	st.offset = (st.offset + 1) % cycleLen;
+}
+
+static void lcdWriteRow(uint8_t row, const char* s16)
+{
+	lcd.setCursor(0, row);
+	for (uint8_t i = 0; i < 16; i++) lcd.write(s16[i]);
+}
+
+static void showStatusDisconnected()
+{
+	displayUsedByConnectionStatus = true;
+	lcd.clear();
+	lcd.setCursor(0, 0); lcd.print(F("STATUS:"));
+	lcd.setCursor(0, 1); lcd.print(F("Disconnected"));
+}
+
+static void showStatusConnected() {
+	displayUsedByConnectionStatus = true;
+	lcd.clear();
+	lcd.setCursor(0, 0); lcd.print(F("STATUS:"));
+	lcd.setCursor(0, 1); lcd.print(F("Connected"));
+}
+
+static void resetAllState() {
+	inputTemperature = 0.0f;
+	inputAirQualityValue = 0;
+	inputMotionDetected = false;
+	leftButtonPressed = false;
+	rightButtonPressed = false;
+
+	output_buzzer_type = ALARM_IDLE;
+	output_display_rgb[0] = 255; output_display_rgb[1] = 255; output_display_rgb[2] = 255;
+	output_display_disable_light = false;
+
+	for (uint8_t i = 0; i < 2; i++) {
+		lcdRow[i].enabled = false;
+		lcdRow[i].secondaryMode = false;
+		lcdRow[i].offset = 0;
+		lcdRow[i].nextAt = 0;
+		lcdRow[i].primary[0] = '\0';
+		lcdRow[i].secondary[0] = '\0';
+		lcdRow[i].text[0] = '\0';
+	}
+
+	SerialLogQueue<8>::Msg lm;
+	while (logQ.pop(lm)) {}
+	SerialTxQueue<6,64>::Frame tf;
+	while (txQ.pop(tf)) {}
+}

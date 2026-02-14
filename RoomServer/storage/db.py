@@ -153,8 +153,8 @@ def ensure_schema(db: Database) -> None:
         """
         CREATE TABLE IF NOT EXISTS room_info (
             room_id VARCHAR(16) PRIMARY KEY NOT NULL,
-            room_name VARCHAR(32),
-            url VARCHAR(255),
+            room_name VARCHAR(32) NOT NULL,
+            url VARCHAR(255) NOT NULL,
             max_temp DECIMAL(5,2) NULL  -- Added max_temp column
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """

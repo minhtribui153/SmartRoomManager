@@ -12,6 +12,7 @@ from env import MYSQL_HOST, MYSQL_USER, MYSQL_PASS, MYSQL_DB
 from storage.db import Database, ensure_schema
 from storage.repo import Repo
 
+import streamlit_shadcn_ui as ui
 
 def build_db_and_repo() -> tuple[Database, Repo]:
     """Initializes database connection and repository."""
@@ -137,7 +138,7 @@ def client_dashboard(repo: Repo) -> None:
     now = datetime.now()
 
     # 1. Room Selection
-    rooms_data = repo._db.fetch_all("SELECT room_id, room_name, url, room_secret FROM room_info")
+    rooms_data = repo._db.fetch_all("SELECT room_id, room_name, url FROM room_info")
     if not rooms_data:
         st.error("System offline: No rooms configured.")
         return
@@ -208,54 +209,89 @@ def client_dashboard(repo: Repo) -> None:
 
     if target_session and target_session.user_uid == user.uid:
         st.subheader("Session Status")
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Session ID", target_session.session_id)
+        m2.metric("Room Name", selected_room["room_name"])
         
         # Get latest room environment data
         latest = repo._db.fetch_one(
             "SELECT temp, air_quality FROM room_sensor_logs WHERE room_id = %s ORDER BY logged_at DESC LIMIT 1",
             (selected_room_id,)
         )
+
+
         if latest:
-            m2.metric("Temperature", f"{latest['temp']} °C")
-            m3.metric("Air Quality", latest['air_quality'].replace('_', ' ').title())
+            m3.metric("Temperature", f"{latest['temp']} °C")
+            m4.metric("Air Quality", latest['air_quality'].replace('_', ' ').title())
             
         st.write(f"Session ends at: {target_session.end_ts}")
-        
+        error = False
         # --- SOCKET CONNECTION & VERIFICATION ---
         if "sio" not in st.session_state:
             sio_client = socketio.Client()
+            
+            # Initialize verification status in session state
+            if "verification_status" not in st.session_state:
+                st.session_state["verification_status"] = None
+
+            # --- NEW: REGISTER EVENT HANDLER ---
+            @sio_client.on("verification_result")
+            def on_verification_result(data):
+                # This runs in a background thread when the server responds
+                st.session_state["verification_status"] = data
+
             try:
-                # Use URL and Secret from DB
-                room_url = selected_room.get('url', 'http://raspberrypi.local:5000')
-                room_secret = selected_room.get('room_secret', '')
-                
-                # Connect with Auth Token
-                sio_client.connect(room_url, auth={"token": room_secret})
+                room_url = selected_room.get('url', 'http://localhost:5000')
+                sio_client.connect(room_url, auth={"session_id": target_session.session_id})
                 st.session_state["sio"] = sio_client
+                error = False
             except Exception as e:
-                st.error(f"Could not connect to Room Server at {room_url}: {e}")
+                st.error(f"Could not connect to Room Server. Session is not available yet.")
+                error = True
 
         sio = st.session_state.get("sio")
 
         # Verification Logic
-        if target_session.status == "scheduled":
+        if target_session.status == "scheduled" and not error:
             st.warning("⚠️ Action Required: Verify your presence.")
             
             if st.button("I am present in the room"):
                 if sio:
                     sio.emit("start_presence_verification", {"user_uid": user.uid})
-                    st.info("Now, press the LEFT button on the room controller to generate your code.")
+                    st.info("Please press the LEFT button on the room controller to generate your code.")
 
-            st.markdown("> Please enter 4-digit verification code")
-            ui.input_otp(max_length=4, key="code_input")
+            st.markdown("> Please enter verification code")
+            ui.input_otp(max_length=6, key="code_input")
             
+            # --- MODIFIED: CONFIRM VERIFICATION LOGIC ---
             if st.button("Confirm Verification"):
                 if sio:
+                    # Reset status before emitting
+                    st.session_state["verification_status"] = None
                     sio.emit("verify_code", {"code": st.session_state['code_input']})
-                    st.success("Verification sent. Please wait...")
-                    time.sleep(2)
-                    st.rerun()
+                    
+                    # Wait for the background thread to receive the "verification_result"
+                    with st.spinner("Verifying with server..."):
+                        timeout = 10  # seconds
+                        start_time = time.time()
+                        
+                        while st.session_state["verification_status"] is None:
+                            time.sleep(0.1)
+                            if time.time() - start_time > timeout:
+                                break
+                    
+                    # Check the result
+                    result = st.session_state.get("verification_status")
+                    
+                    if result and result.get("success") is True:
+                        st.toast("Verification Successful! You can now use the room.", icon="✅")
+                        # Clear status for future use
+                        st.session_state["verification_status"] = None
+                        time.sleep(2)
+                        st.rerun()
+                    else:
+                        st.toast("Verification Failed! You might have entered an invalid verification code or the session is not available anymore.", icon="❌")
+                        st.session_state["verification_status"] = None
 
     else:
         st.warning("Your session has ended or is not valid for this room.")

@@ -35,7 +35,6 @@ def main():
 
     print("Starting client...")
     cli.start()
-    sleep(5)
 
     try:
 
@@ -47,7 +46,7 @@ def main():
         time.sleep(5)
 
         print("Sending BUZZER command")
-        cli.send_cmd("BUZZER,4")
+        cli.send_cmd("BUZZER,2")
 
         time.sleep(10)
 
